@@ -102,9 +102,16 @@ These are Meshtastic UI 1.1.2 behaviours, noted here for whoever looks next:
   when it hears another radio repeat it over LoRa (the implicit ACK). With no LoRa neighbour repeating
   it, the status says failed even though the message went out over MQTT. The reply above came back
   despite that status.
-- **A reply can be stored twice, once from `unknown`.** Packets from nodes the radio hasn't learned yet
-  arrive with `fromId = None` in the meshtastic library. For the same reason, Meshtastic UI's
-  received-packet counter skips them.
+- **Senders show as `unknown`, and a reply can be stored twice, once from `unknown`.** Each packet
+  names its sender only by number (`from`). Names and `!xxxxxxxx` IDs arrive separately, in each
+  node's periodic NODEINFO broadcast. The meshtastic library's `_nodeNumToId()` returns
+  `nodesByNum[num]["user"]["id"]`, and returns `None` when it has no NODEINFO for that node yet (debug
+  log: `Node … not found for fromId`). Meshtastic UI's `normalize_node_id()` turns `None` into
+  `"unknown"` and never falls back to `packet["from"]`, which would give the ID as
+  `f"!{packet['from']:08x}"`. Behind an MQTT client proxy, most nodes' NODEINFO arrives only once the
+  relay runs, so right after setup many senders are `unknown`. A node's name appears once its NODEINFO
+  has arrived; messages stored before that keep `unknown`. For the same reason, Meshtastic UI's
+  received-packet counter skips these packets.
 - **Stats report `channel_count: 0`** even when the radio has a primary channel.
 
 ## License
