@@ -1,0 +1,11 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Meshtastic MQTT proxy",
+        "description": "Relays MQTT both ways for the radio Meshtastic UI holds over USB, using the broker, credentials and channels from the radio's own MQTT settings. The radio must have MQTT enabled with \"proxy to client\" on."
+      }
+    },
+    "abort": { "already_configured": "Already set up." }
+  }
+}

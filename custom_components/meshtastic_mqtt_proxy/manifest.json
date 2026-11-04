@@ -1,0 +1,20 @@
+{
+  "domain": "meshtastic_mqtt_proxy",
+  "name": "Meshtastic MQTT proxy",
+  "after_dependencies": [
+    "meshtastic_ui"
+  ],
+  "codeowners": [
+    "@ardyln"
+  ],
+  "config_flow": true,
+  "documentation": "https://github.com/ardyln/meshtastic-mqtt-proxy",
+  "integration_type": "service",
+  "iot_class": "cloud_push",
+  "issue_tracker": "https://github.com/ardyln/meshtastic-mqtt-proxy/issues",
+  "requirements": [
+    "paho-mqtt>=2.0.0"
+  ],
+  "single_config_entry": true,
+  "version": "0.1.0"
+}
