@@ -22,8 +22,8 @@ through the broker. Diagnosed 2026-11-04.
 
 ## How it works
 
-It is a separate custom integration and does not modify Meshtastic UI. It uses two hooks the
-meshtastic Python library provides for client proxy implementations (python PR #790, merged
+It is a separate custom integration and does not change Meshtastic UI's code. For the relay it uses
+two hooks the meshtastic Python library provides for client proxy implementations (python PR #790, merged
 June 2025):
 
 - **Uplink:** the library publishes every `FromRadio.mqttClientProxyMessage` on the pypubsub topic
@@ -44,6 +44,36 @@ and the credentials are never logged.
 The relay polls Meshtastic UI every 15 s for its current interface
 (`hass.data["meshtastic_ui"]["entries"][…]["connection"].interface`), so it follows reconnects.
 
+### Names on a mesh that mixes licensed and unlicensed nodes
+
+Since July 2025 (firmware `c3b2b474c`, in v2.7.15 but not v2.6.11) a radio drops any NODEINFO whose
+`is_licensed` flag differs from its own: `NodeInfoModule.cpp` returns "handled", so the name is neither
+saved nor passed to the client. The check works both ways. A licensed radio loses the names of
+unlicensed nodes, and an unlicensed radio loses those of licensed nodes. Their other packets still
+arrive, so these nodes show up as `Meshtastic 23f0` with hardware `UNSET`, the placeholder the Python
+library creates in `_getOrCreateByNum()`. Meshtastic UI stores that placeholder as a real name, so its
+own request for missing names never fires either.
+
+The packets are still on the broker, so the relay reads them there:
+
+- It looks at each downlink, including echoes of our own uplinks, because a NODEINFO the radio heard
+  over LoRa may come back that way. It saves every name, but applies one right away only if the
+  licensed flag differs from the radio's; the rest are left to the radio.
+- It writes the name into the library's node table, as the library's own `_onNodeInfoReceive()` does,
+  and publishes `meshtastic.node.updated`, so Meshtastic UI updates by its normal path. This also fixes
+  the sender for nodes that showed as `unknown`.
+- Names are saved in `.storage/meshtastic_mqtt_proxy.names`. A new interface starts with placeholders
+  for every node the radio has no user record for, which also happens now and then to nodes with the
+  same licensed flag. After a restart, saved names replace placeholders only, and are written directly
+  to Meshtastic UI's node store (`bulk_update_nodes`), because the event would mark every node as heard
+  just now.
+
+Limits: only plaintext NODEINFO can be read, which is what a licensed radio's channel carries. A node's
+name appears only after it announces itself once with the relay running, and the firmware default is
+every 3 hours. Names come from unauthenticated broadcasts, as they do on the radio. The node id is
+always derived from the sender, as in the firmware. The `names_learned` attribute on the sensor counts
+the saved names.
+
 ## Install
 
 1. Copy `custom_components/meshtastic_mqtt_proxy` to `/config/custom_components/` and restart.
@@ -63,6 +93,8 @@ The sensor `sensor.meshtastic_mqtt_proxy` reports the state (`waiting_for_radio`
 - It relies on Meshtastic UI exposing `connection.interface`. If a Meshtastic UI update renames that,
   the sensor stays at `waiting_for_radio` until the first uplink frame arrives. Uplink frames carry
   the interface too, so the relay still attaches then.
+- Names use the library's private `_getOrCreateByNum()`, `nodes` and Meshtastic UI's `store` entry.
+  If those change, the relay keeps working and names stop being learned (logged at debug level).
 - One radio only: the first connected Meshtastic UI entry wins.
 - If the phone app connects to the same radio over Bluetooth, it may also proxy. The firmware
   de-duplicates packets by ID.
@@ -71,7 +103,7 @@ The sensor `sensor.meshtastic_mqtt_proxy` reports the state (`waiting_for_radio`
 ## Test
 
 `tests/test_relay.py` exercises topic derivation, uplink, downlink, echo dropping and the
-"proxy off" case, with real meshtastic protobufs and a fake paho client. It makes no network
+"proxy off" case and name learning, with real meshtastic protobufs and a fake paho client. It makes no network
 connections:
 
 ```
@@ -103,15 +135,12 @@ These are Meshtastic UI 1.1.2 behaviours, noted here for whoever looks next:
   it, the status says failed even though the message went out over MQTT. The reply above came back
   despite that status.
 - **Senders show as `unknown`, and a reply can be stored twice, once from `unknown`.** Each packet
-  names its sender only by number (`from`). Names and `!xxxxxxxx` IDs arrive separately, in each
-  node's periodic NODEINFO broadcast. The meshtastic library's `_nodeNumToId()` returns
-  `nodesByNum[num]["user"]["id"]`, and returns `None` when it has no NODEINFO for that node yet (debug
-  log: `Node … not found for fromId`). Meshtastic UI's `normalize_node_id()` turns `None` into
-  `"unknown"` and never falls back to `packet["from"]`, which would give the ID as
-  `f"!{packet['from']:08x}"`. Behind an MQTT client proxy, most nodes' NODEINFO arrives only once the
-  relay runs, so right after setup many senders are `unknown`. A node's name appears once its NODEINFO
-  has arrived; messages stored before that keep `unknown`. For the same reason, Meshtastic UI's
-  received-packet counter skips these packets.
+  names its sender only by number (`from`). The meshtastic library's `_nodeNumToId()` returns `None`
+  until it has a record for that node, and Meshtastic UI's `normalize_node_id()` turns `None` into
+  `"unknown"` instead of falling back to `packet["from"]`. For the same reason, its received-packet
+  counter skips these packets, and messages stored before the node became known keep `unknown`.
+  Behind an MQTT client proxy this mostly hits nodes right after setup. See
+  [Names](#names-on-a-mesh-that-mixes-licensed-and-unlicensed-nodes) for nodes whose name never arrives.
 - **Stats report `channel_count: 0`** even when the radio has a primary channel.
 
 ## License

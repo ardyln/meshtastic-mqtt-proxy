@@ -16,6 +16,12 @@ Subscriptions mirror the firmware's own MQTT::sendSubscriptions(): one
 "<root>/2/e/<channel>/+" per downlink-enabled channel plus "<root>/2/e/PKI/+".
 Broker address and credentials are read from the radio's MQTT module config
 at runtime; they are never stored or logged here.
+
+Names: the firmware drops NODEINFO whose is_licensed flag differs from the local
+node's (NodeInfoModule.cpp), so on a mesh mixing licensed and unlicensed nodes the
+client never gets those names and the library shows "Meshtastic xxxx" placeholders.
+Those packets are still readable on the broker, so the relay takes the names from
+there and hands them to the library's node table.
 """
 
 from __future__ import annotations
@@ -24,13 +30,15 @@ import logging
 import ssl
 import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import paho.mqtt.client as mqtt
 
 _LOGGER = logging.getLogger(__name__)
 
 PROXY_TOPIC = "meshtastic.mqttclientproxymessage"
+NODE_UPDATED_TOPIC = "meshtastic.node.updated"
+BROADCAST_NUM = 0xFFFFFFFF
 MAX_QUEUED_UPLINKS = 200
 
 # DisplayFormatters::getModemPresetDisplayName() in the firmware.
@@ -91,15 +99,61 @@ def read_settings(iface: Any) -> BrokerSettings | None:
     )
 
 
+def parse_nodeinfo(payload: bytes) -> dict[str, Any] | None:
+    """Return the sender's User record if this envelope carries a plaintext NODEINFO."""
+    from google.protobuf.message import DecodeError
+    from meshtastic.protobuf import mesh_pb2, mqtt_pb2, portnums_pb2
+
+    try:
+        packet = mqtt_pb2.ServiceEnvelope.FromString(payload).packet
+        if not packet.HasField("decoded") or packet.decoded.portnum != portnums_pb2.NODEINFO_APP:
+            return None
+        user = mesh_pb2.User.FromString(packet.decoded.payload)
+    except DecodeError:
+        return None
+    sender = getattr(packet, "from")
+    if not sender or sender == BROADCAST_NUM or not user.long_name:
+        return None
+    hw_model = mesh_pb2.HardwareModel.DESCRIPTOR.values_by_number.get(user.hw_model)
+    return {
+        "id": f"!{sender:08x}",  # derived from the sender, as the firmware does
+        "longName": user.long_name,
+        "shortName": user.short_name,
+        "hwModel": hw_model.name if hw_model else "UNSET",
+        "isLicensed": user.is_licensed,
+    }
+
+
+def _is_placeholder(node: dict[str, Any], node_id: str) -> bool:
+    """True if the library made this name up (MeshInterface._getOrCreateByNum)."""
+    name = (node.get("user") or {}).get("longName")
+    return not name or name == f"Meshtastic {node_id[-4:]}"
+
+
+def _write_user(iface: Any, user: dict[str, Any]) -> dict[str, Any]:
+    """Update the library's node table the way its own NODEINFO handler does."""
+    node = iface._getOrCreateByNum(int(user["id"][1:], 16))
+    node["user"] = dict(user)
+    iface.nodes[user["id"]] = node
+    return node
+
+
 class MqttProxyRelay:
     """Relays MQTT traffic between one Meshtastic interface and its broker."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        names: dict[str, dict[str, Any]] | None = None,
+        on_names_changed: Callable[[], None] | None = None,
+    ) -> None:
         self._lock = threading.RLock()        # config / client lifecycle
         self._send_lock = threading.Lock()    # serialises downlink writes to the radio
         self._iface: Any = None
         self._settings: BrokerSettings | None = None
         self._client: mqtt.Client | None = None
+        self._names: dict[str, dict[str, Any]] = dict(names or {})  # node id -> User record
+        self._on_names_changed = on_names_changed
+        self._restored_iface: Any = None
         self.status = "waiting_for_radio"
         self.uplinks = 0
         self.downlinks = 0
@@ -149,6 +203,14 @@ class MqttProxyRelay:
             self._start_client(settings)
 
     @property
+    def names_learned(self) -> int:
+        return len(self._names)
+
+    def names_snapshot(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return dict(self._names)
+
+    @property
     def interface(self) -> Any:
         return self._iface
 
@@ -160,6 +222,52 @@ class MqttProxyRelay:
     @property
     def topics(self) -> list[str]:
         return list(self._settings.topics) if self._settings else []
+
+    # ---- names -----------------------------------------------------------
+
+    def restore_names(self, iface: Any) -> dict[str, dict[str, Any]]:
+        """Reapply saved names to a new interface; return them for Meshtastic UI's store.
+
+        A new interface starts with placeholders for every node the radio has no user
+        record for: always those with the other licensed flag, sometimes others too.
+        """
+        with self._lock:
+            if iface is not self._iface or iface is self._restored_iface:
+                return {}
+            self._restored_iface = iface
+            users = list(self._names.values())
+        updates = {}
+        for user in users:
+            node_id = user["id"]
+            if _is_placeholder(iface._getOrCreateByNum(int(node_id[1:], 16)), node_id):
+                _write_user(iface, user)
+                updates[node_id] = {
+                    "name": user["longName"],
+                    "short_name": user["shortName"],
+                    "hardware_model": user["hwModel"],
+                }
+        return updates
+
+    def _learn_name(self, iface: Any, payload: bytes) -> None:
+        """Save a name from NODEINFO; apply it now if the radio drops it. Never breaks the relay."""
+        try:
+            user = parse_nodeinfo(payload)
+            mine = iface.getMyUser() if user else None
+            if not mine or user["id"] == mine.get("id"):
+                return
+            node_id = user["id"]
+            with self._lock:
+                changed = self._names.get(node_id) != user
+                self._names[node_id] = user
+            if changed and self._on_names_changed:
+                self._on_names_changed()
+            if user["isLicensed"] == bool(mine.get("isLicensed")):
+                return  # the radio passes this one on itself
+            from pubsub import pub
+
+            pub.sendMessage(NODE_UPDATED_TOPIC, node=_write_user(iface, user), interface=iface)
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("Could not read a name from NODEINFO: %s", err)
 
     # ---- MQTT client -----------------------------------------------------
 
@@ -213,6 +321,8 @@ class MqttProxyRelay:
         s, iface = self._settings, self._iface
         if s is None or iface is None:
             return
+        # Before the echo check: a NODEINFO our radio heard over LoRa comes back this way.
+        self._learn_name(iface, bytes(msg.payload))
         if msg.topic.endswith("/" + s.gateway_id):
             # Our own uplink echoed back; the firmware would drop it anyway.
             self.dropped_echoes += 1

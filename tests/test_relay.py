@@ -53,6 +53,61 @@ r._on_message(None, None, msg)
 echo = types.SimpleNamespace(topic="msh/2/e/TA_Mesh/!12345678", payload=b"x")
 r._on_message(None, None, echo)
 print("downlink", calls["radio"], r.downlinks, "echoes dropped", r.dropped_echoes)
+
+# names: the radio drops NODEINFO whose licensed flag differs from its own
+from meshtastic.protobuf import mqtt_pb2, portnums_pb2
+
+def nodeinfo(sender, name, licensed, hw=mesh_pb2.HardwareModel.TBEAM):
+    user = mesh_pb2.User(id=f"!{sender:08x}", long_name=name, short_name=name[:4], hw_model=hw, is_licensed=licensed)
+    p = mesh_pb2.MeshPacket(to=0xffffffff, decoded=mesh_pb2.Data(portnum=portnums_pb2.NODEINFO_APP, payload=user.SerializeToString()))
+    setattr(p, "from", sender)
+    return mqtt_pb2.ServiceEnvelope(packet=p, channel_id="TA_Mesh", gateway_id="!abcdef01").SerializeToString()
+
+def add_node_table(iface, licensed=True):
+    def get_or_create(num):
+        i = f"!{num:08x}"
+        return iface.nodesByNum.setdefault(num, {"num": num, "user": {"id": i, "longName": f"Meshtastic {i[-4:]}", "shortName": i[-4:], "hwModel": "UNSET"}})
+    me = {"num": 0x12345678, "user": {"id": "!12345678", "longName": "ME", "isLicensed": licensed}}
+    iface.nodesByNum, iface.nodes = {0x12345678: me}, {"!12345678": me}
+    iface._getOrCreateByNum = get_or_create
+    iface.getMyUser = lambda: me["user"]
+
+updated, saves = [], []
+def on_updated(node, interface): updated.append(node["user"]["longName"])
+pub.subscribe(on_updated, R.NODE_UPDATED_TOPIC)
+r2 = R.MqttProxyRelay(on_names_changed=lambda: saves.append(1)); iface2 = make_iface(); add_node_table(iface2); r2.attach(iface2)
+def rx(relay, payload, topic="msh/2/e/TA_Mesh/!abcdef01"):
+    relay._on_message(None, None, types.SimpleNamespace(topic=topic, payload=payload))
+
+rx(r2, nodeinfo(0xaaaa0001, "UNLICENSED", False))
+assert iface2.nodes["!aaaa0001"]["user"]["longName"] == "UNLICENSED" and updated == ["UNLICENSED"] and len(saves) == 1
+rx(r2, nodeinfo(0xaaaa0001, "UNLICENSED", False))
+assert len(saves) == 1, "same name again is no change to save"
+rx(r2, nodeinfo(0xaaaa0002, "LICENSED", True))
+assert "!aaaa0002" not in iface2.nodes and r2.names_learned == 2, "saved, but left to the radio for now"
+rx(r2, nodeinfo(0xaaaa0003, "HEARD ON LORA", False), topic="msh/2/e/TA_Mesh/!12345678")
+assert iface2.nodes["!aaaa0003"]["user"]["longName"] == "HEARD ON LORA", "read from our own echo"
+rx(r2, nodeinfo(0x12345678, "SPOOF OF ME", False))
+assert iface2.nodes["!12345678"]["user"]["longName"] == "ME"
+before = r2.downlinks
+rx(r2, b"\xff\xff not protobuf"); rx(r2, nodeinfo(0xaaaa0004, "", False))
+assert r2.downlinks == before + 2 and r2.names_learned == 3, "bad packets are still relayed, and teach nothing"
+rx(r2, nodeinfo(0xaaaa0001, "NOW LICENSED", True))
+assert r2.names_snapshot()["!aaaa0001"]["longName"] == "NOW LICENSED", "a later restore uses the newest name"
+
+# names survive a new interface (HA restart / reconnect); a real name from the radio wins
+r3 = R.MqttProxyRelay({"!aaaa0003": {"id": "!aaaa0003", "longName": "SAVED", "shortName": "SAVE", "hwModel": "TBEAM"},
+                       "!aaaa0005": {"id": "!aaaa0005", "longName": "OLD", "shortName": "OLD", "hwModel": "TBEAM"}})
+iface3 = make_iface(); add_node_table(iface3); iface3._getOrCreateByNum(0xaaaa0005)["user"]["longName"] = "FROM RADIO"
+assert r3.restore_names(iface3) == {}, "interface not attached yet"
+r3.attach(iface3)
+restored = r3.restore_names(iface3)
+assert restored == {"!aaaa0003": {"name": "SAVED", "short_name": "SAVE", "hardware_model": "TBEAM"}}, restored
+assert iface3.nodes["!aaaa0003"]["user"]["longName"] == "SAVED"
+assert iface3.nodesByNum[0xaaaa0005]["user"]["longName"] == "FROM RADIO"
+assert r3.restore_names(iface3) == {}, "once per interface"
+r2.stop(); r3.stop(); print("names ok")
+
 # proxy turned off on radio
 off = make_iface(); off.localNode.moduleConfig.mqtt.proxy_to_client_enabled = False; r.attach(off); print("off ->", r.status)
 r.stop(); print("stopped", r.status)
