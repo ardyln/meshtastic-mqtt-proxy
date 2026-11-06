@@ -23,6 +23,7 @@ PLATFORMS = [Platform.SENSOR]
 POLL = timedelta(seconds=15)
 NAMES_STORE_VERSION = 1
 NAMES_SAVE_DELAY = 30  # seconds
+TIME_SYNC = timedelta(hours=6)  # firmware trusts mesh time again after a day without one
 
 
 def _current_radio(hass: HomeAssistant):
@@ -61,6 +62,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if names and ui_store is not None:
             # Not the node.updated event: that would mark every node as heard just now.
             ui_store.bulk_update_nodes(names)
+        await hass.async_add_executor_job(relay.sync_time)
 
     @callback
     def _poll(_now=None) -> None:
@@ -70,7 +72,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if iface is not None and iface is not relay.interface:
             entry.async_create_background_task(hass, _attach(iface, ui_store), "meshtastic_mqtt_proxy attach")
 
+    @callback
+    def _sync_time(_now) -> None:
+        hass.async_add_executor_job(relay.sync_time)
+
     entry.async_on_unload(async_track_time_interval(hass, _poll, POLL))
+    entry.async_on_unload(async_track_time_interval(hass, _sync_time, TIME_SYNC))
     _poll()
 
     entry.runtime_data = relay

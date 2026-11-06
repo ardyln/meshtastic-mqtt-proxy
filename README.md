@@ -84,6 +84,24 @@ The sensor `sensor.meshtastic_mqtt_proxy` reports the state (`waiting_for_radio`
 `connected`, `reconnecting`, `proxy_off_on_radio`, `error`, `stopped`), with the attributes
 `broker`, `subscriptions`, `uplinks`, `downlinks`, `dropped_echoes` and `last_error`.
 
+### Radio clock
+
+A radio without GPS or a hardware clock normally gets its time from a phone app. No Home Assistant
+integration sends it, so such a radio takes the first time it trusts from the mesh after each boot.
+It keeps that time until the next reboot, because mesh time at the same quality is not reapplied. A
+neighbour with a wrong clock can therefore leave the radio wrong for as long as it runs. One way that
+happens: `getTime()` in firmware `RTC.cpp` can only count 49.71 days since the clock was last set, so
+a node left running longer without a new time falls back by that much, and goes on broadcasting it.
+
+A wrong clock stamps nodes in Meshtastic UI with old "last seen" dates, so its 7-day retention drops
+them at the next restart. It also puts wrong receive times on uplinks.
+
+The relay calls `localNode.setTime()` when it picks up a radio and every 6 hours after that. This
+is the `set_time_only` admin message the phone apps send: it goes to the local radio only, takes no
+airtime, and counts as NTP quality, so it replaces mesh time at once. For a day after each one the
+radio ignores mesh time. The clock is only as good as the Home Assistant host's. `last_time_sync` on
+the sensor shows the last send. A failed send is logged as a warning and doesn't stop the relay.
+
 ## Versions and failure points
 
 - Tested with Home Assistant 2026.10.4 (Python 3.14), meshtastic 2.7.11, paho-mqtt 2.1.0,
@@ -103,7 +121,7 @@ The sensor `sensor.meshtastic_mqtt_proxy` reports the state (`waiting_for_radio`
 ## Test
 
 `tests/test_relay.py` exercises topic derivation, uplink, downlink, echo dropping and the
-"proxy off" case and name learning, with real meshtastic protobufs and a fake paho client. It makes no network
+"proxy off" case, name learning and time sync, with real meshtastic protobufs and a fake paho client. It makes no network
 connections:
 
 ```

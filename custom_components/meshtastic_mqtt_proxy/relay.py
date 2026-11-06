@@ -22,6 +22,10 @@ node's (NodeInfoModule.cpp), so on a mesh mixing licensed and unlicensed nodes t
 client never gets those names and the library shows "Meshtastic xxxx" placeholders.
 Those packets are still readable on the broker, so the relay takes the names from
 there and hands them to the library's node table.
+
+Time: a radio without GPS or a hardware clock gets its time from a phone app, or
+from the mesh, where it keeps the first time it trusts until it reboots. No Home
+Assistant integration sends the time, so the relay does what the phone apps do.
 """
 
 from __future__ import annotations
@@ -30,6 +34,7 @@ import logging
 import ssl
 import threading
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable
 
 import paho.mqtt.client as mqtt
@@ -154,6 +159,7 @@ class MqttProxyRelay:
         self._names: dict[str, dict[str, Any]] = dict(names or {})  # node id -> User record
         self._on_names_changed = on_names_changed
         self._restored_iface: Any = None
+        self.last_time_sync: str | None = None
         self.status = "waiting_for_radio"
         self.uplinks = 0
         self.downlinks = 0
@@ -222,6 +228,20 @@ class MqttProxyRelay:
     @property
     def topics(self) -> list[str]:
         return list(self._settings.topics) if self._settings else []
+
+    # ---- time ------------------------------------------------------------
+
+    def sync_time(self) -> None:
+        """Set the radio's clock from this host. Blocking; a failure only logs."""
+        iface = self._iface
+        if iface is None:
+            return
+        try:
+            with self._send_lock:
+                iface.localNode.setTime()
+            self.last_time_sync = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning("Could not set the radio's clock: %s", err)
 
     # ---- names -----------------------------------------------------------
 

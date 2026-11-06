@@ -45,5 +45,6 @@ class ProxyStatusSensor(SensorEntity):
             "downlinks": r.downlinks,
             "dropped_echoes": r.dropped_echoes,
             "names_learned": r.names_learned,
+            "last_time_sync": r.last_time_sync,
             "last_error": r.last_error,
         }

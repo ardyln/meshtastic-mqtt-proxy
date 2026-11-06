@@ -108,6 +108,16 @@ assert iface3.nodesByNum[0xaaaa0005]["user"]["longName"] == "FROM RADIO"
 assert r3.restore_names(iface3) == {}, "once per interface"
 r2.stop(); r3.stop(); print("names ok")
 
+# time: sent to the radio's own node; a failure neither raises nor counts as synced
+sent, r4 = [], R.MqttProxyRelay()
+r4.sync_time(); assert r4.last_time_sync is None, "no radio yet"
+iface4 = make_iface(); iface4.localNode.setTime = lambda: sent.append(1); r4.attach(iface4)
+r4.sync_time(); assert sent == [1] and r4.last_time_sync
+def broken(): raise OSError("serial gone")
+iface5 = make_iface(); iface5.localNode.setTime = broken; r5 = R.MqttProxyRelay(); r5.attach(iface5)
+r5.sync_time(); assert r5.last_time_sync is None
+r4.stop(); r5.stop(); print("time ok")
+
 # proxy turned off on radio
 off = make_iface(); off.localNode.moduleConfig.mqtt.proxy_to_client_enabled = False; r.attach(off); print("off ->", r.status)
 r.stop(); print("stopped", r.status)
